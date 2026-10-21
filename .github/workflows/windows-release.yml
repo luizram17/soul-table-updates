@@ -1,0 +1,285 @@
+name: Build and publish stable Windows release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - build-request.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    if: github.repository == 'luizram17/soul-table-updates' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the trusted distro main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Enable long Git paths before checking out private source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global core.longpaths true
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Could not enable long Git paths for the Windows source checkout.'
+          }
+
+      - name: Validate the build request from main
+        id: request
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requestPath = Join-Path $env:GITHUB_WORKSPACE 'build-request.json'
+          if (-not (Test-Path -LiteralPath $requestPath -PathType Leaf)) {
+              throw 'build-request.json is missing from the distro main branch.'
+          }
+          if ((Get-Item -LiteralPath $requestPath).Length -gt 8192) {
+              throw 'build-request.json is unexpectedly large.'
+          }
+          $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
+          $fields = @($request.PSObject.Properties.Name | Sort-Object)
+          $expectedFields = @('request_id', 'schema_version', 'source_sha', 'version')
+          if (($fields -join "`n") -ne ($expectedFields -join "`n")) {
+              throw 'build-request.json has an unsupported schema.'
+          }
+          if ($request.schema_version -ne 1) {
+              throw 'build-request.json has an unsupported schema version.'
+          }
+          if ([string]$request.source_sha -notmatch '^[0-9a-f]{40}$') {
+              throw 'build-request.json source_sha must be a lowercase 40-character Git SHA.'
+          }
+          if ([string]$request.version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+              throw 'build-request.json version must be strict semantic version major.minor.patch.'
+          }
+          if ([string]$request.request_id -notmatch '^[0-9]+-[0-9]+$') {
+              throw 'build-request.json request_id is malformed.'
+          }
+          $output = "source_sha=$($request.source_sha)`nversion=$($request.version)`nrequest_id=$($request.request_id)`n"
+          [System.IO.File]::AppendAllText(
+              $env:GITHUB_OUTPUT,
+              $output,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Checkout the requested private source commit
+        uses: actions/checkout@v4
+        with:
+          repository: luizram17/soul-table-companion
+          ref: ${{ steps.request.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Match the private source commit and version to the request
+        shell: pwsh
+        env:
+          REQUEST_SOURCE_SHA: ${{ steps.request.outputs.source_sha }}
+          REQUEST_VERSION: ${{ steps.request.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'source'
+          $actualSha = (& git -C $sourceRoot rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -ne $env:REQUEST_SOURCE_SHA) {
+              throw 'Private checkout does not match the requested source commit.'
+          }
+          $versionPath = Join-Path $sourceRoot 'VERSION.txt'
+          if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
+              throw 'VERSION.txt is missing from the private source commit.'
+          }
+          $sourceVersion = (Get-Content -LiteralPath $versionPath -Raw).Trim()
+          if ($sourceVersion -ne $env:REQUEST_VERSION) {
+              throw 'Requested version does not match VERSION.txt at the private source commit.'
+          }
+
+      - name: Download official Godot 4.7.2 Windows editor and export templates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $godotVersion = '4.7.2'
+          $downloadRoot = Join-Path $env:RUNNER_TEMP 'godot-4.7.2'
+          New-Item -ItemType Directory -Path $downloadRoot -Force | Out-Null
+          $releaseUrl = "https://github.com/godotengine/godot-builds/releases/download/$godotVersion-stable"
+          $editorArchive = Join-Path $downloadRoot 'godot-windows.zip'
+          $templatesTpz = Join-Path $downloadRoot 'godot-export-templates.tpz'
+          Invoke-WebRequest -Uri "$releaseUrl/Godot_v$godotVersion-stable_win64.exe.zip" -OutFile $editorArchive
+          Invoke-WebRequest -Uri "$releaseUrl/Godot_v$godotVersion-stable_export_templates.tpz" -OutFile $templatesTpz
+
+          $editorRoot = Join-Path $downloadRoot 'editor'
+          Expand-Archive -LiteralPath $editorArchive -DestinationPath $editorRoot
+          $godotExe = Join-Path $editorRoot "Godot_v$godotVersion-stable_win64_console.exe"
+          if (-not (Test-Path -LiteralPath $godotExe -PathType Leaf)) {
+              throw 'The official Godot 4.7.2 Windows console editor was not found in the download.'
+          }
+
+          $templatesZip = Join-Path $downloadRoot 'godot-export-templates.zip'
+          Copy-Item -LiteralPath $templatesTpz -Destination $templatesZip
+          $templatesExtract = Join-Path $downloadRoot 'templates-extracted'
+          Expand-Archive -LiteralPath $templatesZip -DestinationPath $templatesExtract
+          $templatesSource = Join-Path $templatesExtract 'templates'
+          if (-not (Test-Path -LiteralPath $templatesSource -PathType Container)) {
+              $templatesSource = $templatesExtract
+          }
+          foreach ($templateName in @('windows_release_x86_64.exe', 'windows_debug_x86_64.exe')) {
+              if (-not (Test-Path -LiteralPath (Join-Path $templatesSource $templateName) -PathType Leaf)) {
+                  throw "Official export templates are missing $templateName."
+              }
+          }
+          $templateDestination = Join-Path $env:APPDATA 'Godot\export_templates\4.7.2.stable'
+          New-Item -ItemType Directory -Path $templateDestination -Force | Out-Null
+          Get-ChildItem -LiteralPath $templatesSource -Force | Copy-Item -Destination $templateDestination -Recurse -Force
+          & $godotExe --version
+          if ($LASTEXITCODE -ne 0) {
+              throw 'The downloaded Godot editor failed its version check.'
+          }
+          [System.IO.File]::AppendAllText(
+              $env:GITHUB_ENV,
+              "GODOT_EXECUTABLE=$godotExe`n",
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Export Windows GM and Player builds
+        id: exports
+        shell: pwsh
+        env:
+          REQUEST_VERSION: ${{ steps.request.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runRoot = Join-Path $env:RUNNER_TEMP "soul-table-release-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $runRoot) {
+              throw 'The per-run temporary output directory already exists.'
+          }
+          New-Item -ItemType Directory -Path $runRoot | Out-Null
+          $exportRoot = Join-Path $runRoot 'exports'
+          $buildScript = Join-Path $env:GITHUB_WORKSPACE 'source\ToolScripts\Release\build_release_artifacts.ps1'
+          if (-not (Test-Path -LiteralPath $buildScript -PathType Leaf)) {
+              throw 'build_release_artifacts.ps1 is missing from the private source checkout.'
+          }
+          & $buildScript -GodotExecutable $env:GODOT_EXECUTABLE -OutputDirectory $exportRoot -SkipAndroid
+          if ($LASTEXITCODE -ne 0) {
+              throw "Windows export script failed (exit $LASTEXITCODE)."
+          }
+          $output = "release_run_root=$runRoot`nexport_root=$exportRoot`nversion=$env:REQUEST_VERSION`n"
+          [System.IO.File]::AppendAllText(
+              $env:GITHUB_OUTPUT,
+              $output,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Validate the update contracts before signing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'source'
+          & (Join-Path $sourceRoot 'ToolScripts/Tests/run_headless_regression.ps1') `
+              -GodotPath $env:GODOT_EXECUTABLE -ProjectRoot $sourceRoot `
+              -ExplicitTestPaths @('Tests/Headless/test_st_245_signed_update_service.gd', 'Tests/Headless/test_st_246_android_sideload_update.gd', 'Tests/Headless/test_windows_release_update.gd') `
+              -OutputRoot (Join-Path $env:RUNNER_TEMP 'update-contracts')
+          if ($LASTEXITCODE -ne 0) { throw 'Update contract regression failed.' }
+          & (Join-Path $sourceRoot 'ToolScripts/Release/run_exported_smoke.ps1') `
+              -ArtifactDirectory '${{ steps.exports.outputs.export_root }}' `
+              -OutputDirectory (Join-Path $env:RUNNER_TEMP 'exported-smoke') -SkipAndroid
+          if ($LASTEXITCODE -ne 0) { throw 'Exported Windows smoke failed.' }
+
+      - name: Install the Python cryptography dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          py -3 --version
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Python 3 is required on the Windows runner.'
+          }
+          py -3 -m pip install --disable-pip-version-check --only-binary=:all: cryptography
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Could not install the cryptography wheel.'
+          }
+          py -3 -c "import cryptography; print('cryptography', cryptography.__version__)"
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Python cryptography import check failed.'
+          }
+
+      - name: Create signed update ZIPs and manifests
+        id: packages
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY_PEM: ${{ secrets.UPDATE_SIGNING_KEY_PEM }}
+          REQUEST_VERSION: ${{ steps.request.outputs.version }}
+          EXPORT_ROOT: ${{ steps.exports.outputs.export_root }}
+          RELEASE_RUN_ROOT: ${{ steps.exports.outputs.release_run_root }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:UPDATE_SIGNING_KEY_PEM)) {
+              throw 'UPDATE_SIGNING_KEY_PEM secret is required.'
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP "soul-table-update-signing-$env:GITHUB_RUN_ID.pem"
+          $packageRoot = Join-Path $env:RELEASE_RUN_ROOT 'signed-packages'
+          try {
+              [System.IO.File]::WriteAllText(
+                  $keyPath,
+                  $env:UPDATE_SIGNING_KEY_PEM,
+                  [System.Text.Encoding]::ASCII
+              )
+              Remove-Item -LiteralPath 'Env:\UPDATE_SIGNING_KEY_PEM' -ErrorAction SilentlyContinue
+              $packager = Join-Path $env:GITHUB_WORKSPACE 'source\ToolScripts\Release\create_windows_update_package.py'
+              if (-not (Test-Path -LiteralPath $packager -PathType Leaf)) {
+                  throw 'create_windows_update_package.py is missing from the private source checkout.'
+              }
+              py -3 $packager `
+                  --exports-root $env:EXPORT_ROOT `
+                  --version $env:REQUEST_VERSION `
+                  --repository luizram17/soul-table-updates `
+                  --channel stable `
+                  --private-key $keyPath `
+                  --output-dir $packageRoot `
+                  --minimum-supported 0.0.0 `
+                  --expires-in-days 180
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Windows update package creation failed (exit $LASTEXITCODE)."
+              }
+              $output = "release_directory=$packageRoot`n"
+              [System.IO.File]::AppendAllText(
+                  $env:GITHUB_OUTPUT,
+                  $output,
+                  [System.Text.UTF8Encoding]::new($false)
+              )
+          }
+          finally {
+              Remove-Item -LiteralPath 'Env:\UPDATE_SIGNING_KEY_PEM' -ErrorAction SilentlyContinue
+              if (Test-Path -LiteralPath $keyPath -PathType Leaf) {
+                  Remove-Item -LiteralPath $keyPath -Force
+              }
+          }
+
+      - name: Publish the signed assets as a new stable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIRECTORY: ${{ steps.packages.outputs.release_directory }}
+          RELEASE_VERSION: ${{ steps.request.outputs.version }}
+        run: |
+          $publisher = Join-Path $env:GITHUB_WORKSPACE 'ToolScripts\Release\ci\publish_windows_release.ps1'
+          if (-not (Test-Path -LiteralPath $publisher -PathType Leaf)) {
+              throw 'Trusted publish helper is missing from the checked out distro main branch.'
+          }
+          & $publisher `
+              -Version $env:RELEASE_VERSION `
+              -ReleaseDirectory $env:RELEASE_DIRECTORY `
+              -TargetCommit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+              throw "GitHub release publish helper failed (exit $LASTEXITCODE)."
+          }
