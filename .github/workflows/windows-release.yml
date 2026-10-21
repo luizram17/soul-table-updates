@@ -119,6 +119,12 @@ jobs:
           $templatesTpz = Join-Path $downloadRoot 'godot-export-templates.tpz'
           Invoke-WebRequest -Uri "$releaseUrl/Godot_v$godotVersion-stable_win64.exe.zip" -OutFile $editorArchive
           Invoke-WebRequest -Uri "$releaseUrl/Godot_v$godotVersion-stable_export_templates.tpz" -OutFile $templatesTpz
+          if ((Get-FileHash -LiteralPath $editorArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '731980f9608d61333e5baf54a2ef17210acc7a538446c0cb9969f002aca1e953') {
+              throw 'Official Godot editor checksum mismatch.'
+          }
+          if ((Get-FileHash -LiteralPath $templatesTpz -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'f298490b8d44d934be425a5a65a51bf15f422428b229a06a6e11d9ffea248011') {
+              throw 'Official Godot export templates checksum mismatch.'
+          }
 
           $editorRoot = Join-Path $downloadRoot 'editor'
           Expand-Archive -LiteralPath $editorArchive -DestinationPath $editorRoot
@@ -127,22 +133,18 @@ jobs:
               throw 'The official Godot 4.7.2 Windows console editor was not found in the download.'
           }
 
-          $templatesZip = Join-Path $downloadRoot 'godot-export-templates.zip'
-          Copy-Item -LiteralPath $templatesTpz -Destination $templatesZip
-          $templatesExtract = Join-Path $downloadRoot 'templates-extracted'
-          Expand-Archive -LiteralPath $templatesZip -DestinationPath $templatesExtract
-          $templatesSource = Join-Path $templatesExtract 'templates'
-          if (-not (Test-Path -LiteralPath $templatesSource -PathType Container)) {
-              $templatesSource = $templatesExtract
-          }
-          foreach ($templateName in @('windows_release_x86_64.exe', 'windows_debug_x86_64.exe')) {
-              if (-not (Test-Path -LiteralPath (Join-Path $templatesSource $templateName) -PathType Leaf)) {
-                  throw "Official export templates are missing $templateName."
-              }
-          }
           $templateDestination = Join-Path $env:APPDATA 'Godot\export_templates\4.7.2.stable'
           New-Item -ItemType Directory -Path $templateDestination -Force | Out-Null
-          Get-ChildItem -LiteralPath $templatesSource -Force | Copy-Item -Destination $templateDestination -Recurse -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($templatesTpz)
+          try {
+              foreach ($name in @('windows_release_x86_64.exe', 'windows_debug_x86_64.exe', 'windows_release_x86_64_console.exe', 'windows_debug_x86_64_console.exe')) {
+                  $entry = $archive.GetEntry("templates/$name")
+                  if ($null -eq $entry) { throw "Official export templates are missing $name." }
+                  [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $templateDestination $name), $false)
+              }
+          }
+          finally { $archive.Dispose() }
           & $godotExe --version
           if ($LASTEXITCODE -ne 0) {
               throw 'The downloaded Godot editor failed its version check.'
