@@ -190,7 +190,7 @@ jobs:
           $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'source'
           & (Join-Path $sourceRoot 'ToolScripts/Tests/run_headless_regression.ps1') `
               -GodotPath $env:GODOT_EXECUTABLE -ProjectRoot $sourceRoot `
-              -ExplicitTestPaths @('Tests/Headless/test_st_245_signed_update_service.gd', 'Tests/Headless/test_st_246_android_sideload_update.gd', 'Tests/Headless/test_windows_release_update.gd') `
+              -ExplicitTestPaths @('Tests/Headless/test_st_245_signed_update_service.gd', 'Tests/Headless/test_st_246_android_sideload_update.gd', 'Tests/Headless/test_windows_release_update.gd', 'Tests/Headless/test_fixed_aspect_ratio.gd', 'Tests/Headless/test_wizard_responsive_layout.gd', 'Tests/Headless/test_st_240_accessibility_runtime.gd', 'Tests/Headless/test_st_247_reproducible_exports.gd') `
               -OutputRoot (Join-Path $env:RUNNER_TEMP 'update-contracts')
           if ($LASTEXITCODE -ne 0) { throw 'Update contract regression failed.' }
           & (Join-Path $sourceRoot 'ToolScripts/Release/run_exported_smoke.ps1') `
